@@ -164,14 +164,16 @@ Three metrics sets are available:
 | `SRE` | Configurable via a `sre-metric-set` ConfigMap with custom RelabelConfigs per component | Fine-grained control for alerting and troubleshooting |
 | `All` | All metrics from each component (some legacy metrics are still dropped) | Full observability |
 
-The metrics set is configured globally on the HyperShift Operator deployment:
+The global `METRICS_SET` environment variable on the HyperShift Operator configures the management-cluster monitoring metrics set:
 
 ```shell
 oc set env -n hypershift deployment/operator METRICS_SET=All
 ```
 
+A HostedCluster's `spec.monitoring.metricsSet` can override this global setting. The forwarding proxy uses that effective metrics set unless `spec.monitoring.metricsForwarding.metricsSet` is set; the forwarding-specific field changes filtering only on the forwarding path and does not change management-cluster ServiceMonitor or PodMonitor relabeling. If neither field overrides the global setting, `METRICS_SET` defaults to `Telemetry`.
+
 !!! note
-    The metrics-proxy defaults to `All` when no metrics set is explicitly configured. This means that if the HyperShift Operator does not have `METRICS_SET` set, all metrics will be forwarded to the guest cluster.
+    The forwarding metrics set is not normally `All` by default. To use a different set only for forwarding, set `spec.monitoring.metricsForwarding.metricsSet` on the HostedCluster.
 
 #### Example: Telemetry metrics set
 
@@ -194,7 +196,7 @@ Similar curated subsets apply to each of the other ServiceMonitor-based componen
 
 #### Example: SRE metrics set with custom configuration
 
-With `METRICS_SET=SRE`, you can define exactly which metrics to forward per component by creating a ConfigMap named `sre-metric-set` in each control plane namespace. Each key in the ConfigMap's `config` field maps a component name to a list of Prometheus RelabelConfigs (typically `action: keep` with a regex on `__name__`). See the [dashboard example below](#using-the-dashboard-with-the-sre-metrics-set) for a complete ConfigMap.
+When SRE is selected for monitoring or forwarding, configure it with a ConfigMap named `sre-metric-set` in the HyperShift Operator's namespace (typically `hypershift`). Its `config` key contains component names mapped to Prometheus RelabelConfigs (typically `action: keep` with a regex on `__name__`). The HyperShift Operator copies this ConfigMap into each relevant HCP namespace; do not create the source ConfigMap separately in each control plane namespace. See the [dashboard example below](#using-the-dashboard-with-the-sre-metrics-set) for a complete ConfigMap.
 
 The configurable components are:
 
@@ -213,7 +215,7 @@ The configurable components are:
 - `hostedClusterConfigOperator`
 
 !!! note
-    PodMonitor-based components (cluster-autoscaler, ignition-server, karpenter, etc.) are not subject to metric filtering and always forward all their metrics regardless of the configured metrics set.
+    The metrics-proxy filters a fixed set of known ServiceMonitor component names; it does not dynamically map every discovered monitor. For a known ServiceMonitor component, missing SRE rules fail closed and no metrics for that component are forwarded. An unrecognized ServiceMonitor name is passed through unfiltered. PodMonitor-based components (cluster-autoscaler, ignition-server, karpenter, etc.) are also passed through unfiltered for every metrics set, so their metrics are not limited by SRE rules.
 
 ### Label compatibility
 
@@ -245,14 +247,14 @@ Using `METRICS_SET=SRE` lets you forward exactly the metrics the dashboard needs
     oc set env -n hypershift deployment/operator METRICS_SET=SRE
     ```
 
-2. Create the `sre-metric-set` ConfigMap in the HCP namespace with the relabel configs that match the dashboard panels:
+2. Create the source `sre-metric-set` ConfigMap in the HyperShift Operator namespace with the relabel configs that match the dashboard panels. For the default operator namespace, this is `hypershift`:
 
     ```yaml
     apiVersion: v1
     kind: ConfigMap
     metadata:
       name: sre-metric-set
-      namespace: <HCP_NAMESPACE>
+      namespace: hypershift
     data:
       config: |
         kubeAPIServer:
@@ -280,7 +282,7 @@ Using `METRICS_SET=SRE` lets you forward exactly the metrics the dashboard needs
     This forwards only the 20 metric names used by the dashboard across 5 components. Components not listed (openshift-apiserver, openshift-controller-manager, etc.) will have no metrics forwarded, which is fine since the dashboard doesn't use them.
 
     !!! tip
-        You can extend this ConfigMap over time. For example, to add etcd proposal metrics for a new panel, append `|etcd_server_proposals_.*` to the etcd regex. The dashboard will pick up the new metrics on the next scrape cycle.
+        You can extend this ConfigMap over time. For example, to add etcd proposal metrics for a new panel, append `|etcd_server_proposals_.*` to the etcd regex. The operator copies the change to the HCP ConfigMap, whose content is included in the metrics-proxy pod-template config hash. This triggers a metrics-proxy rollout so the process loads the new rules at startup; the proxy does not hot-reload the ConfigMap, so the change is not effective on the next scrape cycle alone.
 
 3. Apply the ConfigMap:
 
@@ -288,7 +290,7 @@ Using `METRICS_SET=SRE` lets you forward exactly the metrics the dashboard needs
     oc apply -f sre-metric-set.yaml
     ```
 
-    The CPO will detect the ConfigMap change and update the metrics-proxy configuration automatically.
+    The HyperShift Operator watches the source ConfigMap and copies it to the HCP namespace. The updated HCP ConfigMap changes the metrics-proxy config hash and automatically rolls out the proxy so it loads the new configuration at startup.
 
 #### Loading the dashboard into the hosted cluster
 

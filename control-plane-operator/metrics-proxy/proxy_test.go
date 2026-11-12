@@ -10,12 +10,17 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/gomega"
 
 	"github.com/go-logr/logr"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
+
+	"github.com/openshift/hypershift/support/metrics"
 )
 
 type fakeComponentProvider struct {
@@ -294,6 +299,48 @@ func TestProxyHandler_ServeHTTP(t *testing.T) {
 
 		// Trailing slash should be trimmed and resolve to "etcd", returning 200 (empty targets).
 		g.Expect(rec.Code).To(Equal(http.StatusOK))
+	})
+
+	t.Run("When scraping with telemetry filtering, it should return a parseable filtered response", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		fakeMetrics := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintln(w, `# HELP etcd_server_leader_changes_seen_total Leader changes`)
+			fmt.Fprintln(w, `# TYPE etcd_server_leader_changes_seen_total gauge`)
+			fmt.Fprintln(w, `etcd_server_leader_changes_seen_total 2`)
+			fmt.Fprintln(w, `# HELP etcd_some_other_metric Excluded metric`)
+			fmt.Fprintln(w, `# TYPE etcd_some_other_metric gauge`)
+			fmt.Fprintln(w, `etcd_some_other_metric 3`)
+		}))
+		defer fakeMetrics.Close()
+
+		fakeHost, fakePort := parseHostPort(t, fakeMetrics.URL)
+		handler := NewProxyHandler(
+			logr.Discard(),
+			&fakeComponentProvider{components: map[string]ComponentConfig{
+				"etcd": {MetricsPort: fakePort, MetricsPath: "/metrics", MetricsScheme: "http"},
+			}},
+			&fakeTargetDiscoverer{targets: []ScrapeTarget{{PodName: "etcd-0", PodIP: fakeHost, Port: fakePort}}},
+			NewScraper(),
+			NewFilter(metrics.MetricsSetTelemetry),
+			NewLabeler("test-namespace"),
+		)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics/etcd", nil)
+		g.Expect(err).NotTo(HaveOccurred())
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		g.Expect(rec.Code).To(Equal(http.StatusOK))
+		parser := expfmt.NewTextParser(model.LegacyValidation)
+		families, err := parser.TextToMetricFamilies(strings.NewReader(rec.Body.String()))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(families).To(HaveKey("etcd_server_leader_changes_seen_total"))
+		g.Expect(families).NotTo(HaveKey("etcd_some_other_metric"))
+		g.Expect(rec.Body.String()).To(ContainSubstring(`pod="etcd-0"`))
+		g.Expect(rec.Body.String()).To(ContainSubstring(`namespace="test-namespace"`))
 	})
 
 }

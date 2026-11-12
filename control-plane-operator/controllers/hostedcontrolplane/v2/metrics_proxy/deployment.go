@@ -40,9 +40,29 @@ func adaptDeployment(cpContext component.WorkloadContext, deployment *appsv1.Dep
 			"--metrics-set", string(metricsSet),
 		)
 		c.VolumeMounts = append(c.VolumeMounts, volumeMounts...)
+		if metricsSet == metrics.MetricsSetSRE {
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
+				Name:      "sre-metrics-config",
+				MountPath: "/etc/metrics-proxy/sre-metrics-config",
+			})
+		}
 	})
 
 	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, volumes...)
+	if metricsSet == metrics.MetricsSetSRE {
+		deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: "sre-metrics-config",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: metrics.SREConfigurationConfigMapName,
+					},
+					Items:    []corev1.KeyToPath{{Key: metrics.SREConfigurationConfigMapKey, Path: metrics.SREConfigurationConfigMapKey}},
+					Optional: ptr.To(true),
+				},
+			},
+		})
+	}
 
 	return nil
 }

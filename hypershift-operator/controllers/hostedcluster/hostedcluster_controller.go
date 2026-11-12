@@ -6005,25 +6005,27 @@ func (r *HostedClusterReconciler) effectiveGMPMonitoring(log logr.Logger, platfo
 // and ensures that it is synced to the hosted control plane
 func (r *HostedClusterReconciler) reconcileSREMetricsConfig(ctx context.Context, createOrUpdate upsert.CreateOrUpdateFN, hcp *hyperv1.HostedControlPlane) error {
 	log := ctrl.LoggerFrom(ctx)
-	if r.effectiveMetricsSet(hcp.Spec.Monitoring) != metrics.MetricsSetSRE {
+	if r.effectiveMetricsSet(hcp.Spec.Monitoring) != metrics.MetricsSetSRE && hcp.Spec.Monitoring.MetricsForwarding.MetricsSet != hyperv1.MetricsSetSRE {
 		return nil
 	}
 	log.Info("Reconciling SRE metrics configuration")
 	cm := metrics.SREMetricsSetConfigurationConfigMap(r.OperatorNamespace)
 	if err := r.Get(ctx, client.ObjectKeyFromObject(cm), cm); err != nil {
-		if apierrors.IsNotFound(err) {
-			log.Info("SRE configuration does not exist")
-			return nil
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to get SRE configuration configmap: %w", err)
 		}
-		return fmt.Errorf("failed to get SRE configuration configmap: %w", err)
+		log.Info("SRE configuration does not exist")
+		cm.Data = nil
 	}
 	currentMetricsSetConfigHash := metrics.SREMetricsSetConfigHash(cm)
+	var loadErr error
 	if currentMetricsSetConfigHash != r.SREConfigHash {
-		// Only load a new config if configuration content has changed
-		if err := metrics.LoadSREMetricsSetConfigurationFromConfigMap(cm); err != nil {
-			return fmt.Errorf("failed to load SRE configuration: %w", err)
+		if len(cm.Data) != 0 {
+			loadErr = metrics.LoadSREMetricsSetConfigurationFromConfigMap(cm)
 		}
-		r.SREConfigHash = currentMetricsSetConfigHash
+		if loadErr == nil {
+			r.SREConfigHash = currentMetricsSetConfigHash
+		}
 	}
 	destinationCM := metrics.SREMetricsSetConfigurationConfigMap(hcp.Namespace)
 	ownerRef := config.OwnerRefFrom(hcp)
@@ -6033,6 +6035,9 @@ func (r *HostedClusterReconciler) reconcileSREMetricsConfig(ctx context.Context,
 		return nil
 	}); err != nil {
 		return fmt.Errorf("failed to update hosted cluster SRE metrics configuration: %w", err)
+	}
+	if loadErr != nil {
+		return fmt.Errorf("failed to load SRE configuration: %w", loadErr)
 	}
 	return nil
 }

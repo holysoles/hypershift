@@ -9,6 +9,7 @@ import (
 	"github.com/go-logr/logr"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
+	"google.golang.org/protobuf/proto"
 )
 
 type ProxyHandler struct {
@@ -74,7 +75,6 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Merge, filter, and label results
 	format := expfmt.NewFormat(expfmt.TypeTextPlain)
 	var buf bytes.Buffer
-	encoder := expfmt.NewEncoder(&buf, format)
 
 	successes := 0
 	var failedTargets []ScrapeTarget
@@ -86,21 +86,40 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		successes++
 
-		families := h.filter.Apply(componentName, result.Families)
-		families = h.labeler.Inject(families, targets[i], componentName, componentConfig)
-
-		for _, mf := range families {
-			if err := encoder.Encode(mf); err != nil {
-				h.log.Error(err, "encode error")
+		for _, sourceFamily := range result.Families {
+			if sourceFamily == nil {
+				continue
 			}
+
+			// Label injection mutates DTOs, so encode a copy rather than changing
+			// the scraper's family data.
+			family := proto.Clone(sourceFamily).(*dto.MetricFamily)
+			h.labeler.Inject(map[string]*dto.MetricFamily{family.GetName(): family}, targets[i], componentName, componentConfig)
+
+			var familyBuffer bytes.Buffer
+			encoder := expfmt.NewEncoder(&familyBuffer, format)
+			if err := encoder.Encode(family); err != nil {
+				h.log.Error(err, "encode error")
+				continue
+			}
+			filtered, err := h.filter.ApplyExposition(componentName, sourceFamily, familyBuffer.Bytes())
+			if err != nil {
+				h.log.Error(err, "metrics filtering failed", "component", componentName, "metric", sourceFamily.GetName())
+				continue
+			}
+			_, _ = buf.Write(filtered)
 		}
 	}
 
 	// Emit synthetic scrape error counter for failed targets.
 	if len(failedTargets) > 0 {
 		errorFamily := buildScrapeErrorMetric(componentName, failedTargets)
+		var errorBuffer bytes.Buffer
+		encoder := expfmt.NewEncoder(&errorBuffer, format)
 		if err := encoder.Encode(errorFamily); err != nil {
 			h.log.Error(err, "encode error for scrape error metric")
+		} else {
+			_, _ = buf.Write(errorBuffer.Bytes())
 		}
 	}
 

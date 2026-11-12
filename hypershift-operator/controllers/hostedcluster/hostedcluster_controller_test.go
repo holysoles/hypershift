@@ -9439,14 +9439,11 @@ func TestReconcileSREMetricsConfig_EffectiveMetricsSet(t *testing.T) {
 		},
 	}
 
-	noopCreateOrUpdate := func(ctx context.Context, c crclient.Client, obj crclient.Object, f controllerutil.MutateFn) (controllerutil.OperationResult, error) {
-		return controllerutil.OperationResultNone, nil
-	}
-
 	tests := []struct {
 		name               string
 		operatorMetricSet  metrics.MetricsSet
 		hcpMetricsSet      hyperv1.MetricsSet
+		forwardingSet      hyperv1.MetricsSet
 		expectSREReconcile bool
 	}{
 		{
@@ -9473,6 +9470,18 @@ func TestReconcileSREMetricsConfig_EffectiveMetricsSet(t *testing.T) {
 			hcpMetricsSet:      hyperv1.MetricsSetTelemetry,
 			expectSREReconcile: false,
 		},
+		{
+			name:               "When MetricsForwarding.MetricsSet is SRE it should reconcile SRE config even when the effective monitoring set is Telemetry",
+			operatorMetricSet:  metrics.MetricsSetTelemetry,
+			forwardingSet:      hyperv1.MetricsSetSRE,
+			expectSREReconcile: true,
+		},
+		{
+			name:               "When MetricsForwarding.MetricsSet is Telemetry it should not suppress SRE config needed by the effective monitoring set",
+			operatorMetricSet:  metrics.MetricsSetSRE,
+			forwardingSet:      hyperv1.MetricsSetTelemetry,
+			expectSREReconcile: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -9481,6 +9490,7 @@ func TestReconcileSREMetricsConfig_EffectiveMetricsSet(t *testing.T) {
 
 			hcp := baseHCP.DeepCopy()
 			hcp.Spec.Monitoring.MetricsSet = tt.hcpMetricsSet
+			hcp.Spec.Monitoring.MetricsForwarding.MetricsSet = tt.forwardingSet
 
 			objs := []crclient.Object{}
 			if tt.expectSREReconcile {
@@ -9494,14 +9504,80 @@ func TestReconcileSREMetricsConfig_EffectiveMetricsSet(t *testing.T) {
 				OperatorNamespace: operatorNS,
 			}
 
+			var syncedSREConfig *corev1.ConfigMap
+			createOrUpdate := func(_ context.Context, _ crclient.Client, obj crclient.Object, mutate controllerutil.MutateFn) (controllerutil.OperationResult, error) {
+				if err := mutate(); err != nil {
+					return controllerutil.OperationResultNone, err
+				}
+				if cm, ok := obj.(*corev1.ConfigMap); ok {
+					syncedSREConfig = cm.DeepCopy()
+				}
+				return controllerutil.OperationResultNone, nil
+			}
 			ctx := ctrl.LoggerInto(t.Context(), zap.New(zap.UseDevMode(true), zap.Level(zapcore.InfoLevel)))
-			err := r.reconcileSREMetricsConfig(ctx, noopCreateOrUpdate, hcp)
+			err := r.reconcileSREMetricsConfig(ctx, createOrUpdate, hcp)
 			g.Expect(err).ToNot(HaveOccurred())
 
 			if tt.expectSREReconcile {
-				g.Expect(r.SREConfigHash).ToNot(BeEmpty(), "SRE config hash should be set when SRE metrics are active")
+				g.Expect(r.SREConfigHash).To(Equal(metrics.SREMetricsSetConfigHash(sreConfigCM)), "SRE config hash should match the synced configuration")
+				g.Expect(syncedSREConfig).ToNot(BeNil())
+				g.Expect(syncedSREConfig.Data).To(Equal(sreConfigCM.Data))
 			} else {
 				g.Expect(r.SREConfigHash).To(BeEmpty(), "SRE config hash should not be set when SRE metrics are not active")
+				g.Expect(syncedSREConfig).To(BeNil())
+			}
+		})
+	}
+}
+
+func TestReconcileSREMetricsConfig_UnavailableConfigClearsForwardingCopy(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		config  *corev1.ConfigMap
+		wantErr bool
+	}{
+		{name: "deleted source"},
+		{name: "malformed source", config: &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: metrics.SREConfigurationConfigMapName, Namespace: "hypershift"},
+			Data:       map[string]string{metrics.SREConfigurationConfigMapKey: "["},
+		}, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			objects := []crclient.Object{}
+			if tt.config != nil {
+				objects = append(objects, tt.config)
+			}
+			r := &HostedClusterReconciler{
+				Client:     fake.NewClientBuilder().WithScheme(api.Scheme).WithObjects(objects...).Build(),
+				MetricsSet: metrics.MetricsSetTelemetry, OperatorNamespace: "hypershift", SREConfigHash: "previous",
+			}
+			hcp := &hyperv1.HostedControlPlane{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "clusters-test"},
+				Spec: hyperv1.HostedControlPlaneSpec{Monitoring: hyperv1.MonitoringSpec{
+					MetricsForwarding: hyperv1.MetricsForwardingSpec{MetricsSet: hyperv1.MetricsSetSRE},
+				}},
+			}
+			var copied *corev1.ConfigMap
+			createOrUpdate := func(_ context.Context, _ crclient.Client, obj crclient.Object, mutate controllerutil.MutateFn) (controllerutil.OperationResult, error) {
+				if err := mutate(); err != nil {
+					return controllerutil.OperationResultNone, err
+				}
+				copied = obj.(*corev1.ConfigMap).DeepCopy()
+				return controllerutil.OperationResultNone, nil
+			}
+			err := r.reconcileSREMetricsConfig(t.Context(), createOrUpdate, hcp)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("reconcileSREMetricsConfig() error = %v, want error = %v", err, tt.wantErr)
+			}
+			if copied == nil {
+				t.Fatal("SRE configuration was not synced to the HCP")
+			}
+			if tt.config == nil {
+				if len(copied.Data) != 0 || r.SREConfigHash != "" {
+					t.Fatalf("deleted source retained SRE config: data=%v hash=%q", copied.Data, r.SREConfigHash)
+				}
+			} else if copied.Data[metrics.SREConfigurationConfigMapKey] != "[" {
+				t.Fatalf("malformed SRE config was not propagated: %v", copied.Data)
 			}
 		})
 	}

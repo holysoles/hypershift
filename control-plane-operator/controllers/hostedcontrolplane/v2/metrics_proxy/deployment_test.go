@@ -538,6 +538,7 @@ func TestAdaptDeployment_MetricsSetOverride(t *testing.T) {
 		contextMetricsSet  metrics.MetricsSet
 		forwardingSet      hyperv1.MetricsSet
 		expectedMetricsSet string
+		expectSREConfig    bool
 	}{
 		{
 			name:               "When MetricsForwarding.MetricsSet is set it should override cpContext.MetricsSet",
@@ -550,6 +551,20 @@ func TestAdaptDeployment_MetricsSetOverride(t *testing.T) {
 			contextMetricsSet:  metrics.MetricsSetSRE,
 			forwardingSet:      "",
 			expectedMetricsSet: string(metrics.MetricsSetSRE),
+			expectSREConfig:    true,
+		},
+		{
+			name:               "When MetricsForwarding.MetricsSet is SRE it should mount the SRE configuration",
+			contextMetricsSet:  metrics.MetricsSetTelemetry,
+			forwardingSet:      hyperv1.MetricsSetSRE,
+			expectedMetricsSet: string(metrics.MetricsSetSRE),
+			expectSREConfig:    true,
+		},
+		{
+			name:               "When MetricsForwarding.MetricsSet is Telemetry it should not mount SRE configuration",
+			contextMetricsSet:  metrics.MetricsSetSRE,
+			forwardingSet:      hyperv1.MetricsSetTelemetry,
+			expectedMetricsSet: string(metrics.MetricsSetTelemetry),
 		},
 		{
 			name:               "When both MetricsForwarding.MetricsSet and cpContext.MetricsSet are empty it should default to All",
@@ -585,6 +600,35 @@ func TestAdaptDeployment_MetricsSetOverride(t *testing.T) {
 			err := adaptDeployment(cpContext, dep)
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(metricsSetArg(dep)).To(Equal(tt.expectedMetricsSet))
+
+			var sreConfigVolume *corev1.Volume
+			for i := range dep.Spec.Template.Spec.Volumes {
+				if dep.Spec.Template.Spec.Volumes[i].Name == "sre-metrics-config" {
+					sreConfigVolume = &dep.Spec.Template.Spec.Volumes[i]
+					break
+				}
+			}
+			var hasSREConfigMount bool
+			for _, container := range dep.Spec.Template.Spec.Containers {
+				if container.Name != ComponentName {
+					continue
+				}
+				for _, mount := range container.VolumeMounts {
+					if mount.Name == "sre-metrics-config" && mount.MountPath == "/etc/metrics-proxy/sre-metrics-config" {
+						hasSREConfigMount = true
+					}
+				}
+			}
+			if tt.expectSREConfig {
+				g.Expect(sreConfigVolume).ToNot(BeNil())
+				g.Expect(hasSREConfigMount).To(BeTrue())
+				g.Expect(sreConfigVolume.ConfigMap.Name).To(Equal(metrics.SREConfigurationConfigMapName))
+				g.Expect(sreConfigVolume.ConfigMap.Optional).To(Equal(ptr.To(true)))
+				g.Expect(sreConfigVolume.ConfigMap.Items).To(Equal([]corev1.KeyToPath{{Key: metrics.SREConfigurationConfigMapKey, Path: metrics.SREConfigurationConfigMapKey}}))
+			} else {
+				g.Expect(sreConfigVolume).To(BeNil())
+				g.Expect(hasSREConfigMount).To(BeFalse())
+			}
 		})
 	}
 }

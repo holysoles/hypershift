@@ -14,6 +14,8 @@ import (
 	"github.com/openshift/hypershift/support/metrics"
 	"github.com/openshift/hypershift/support/supportedversion"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -34,6 +36,19 @@ func requireClientCert(next http.Handler) http.Handler {
 	})
 }
 
+func loadSREMetricsSetConfiguration(path string) error {
+	config, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	cm := &corev1.ConfigMap{
+		Data: map[string]string{
+			metrics.SREConfigurationConfigMapKey: string(config),
+		},
+	}
+	return metrics.LoadSREMetricsSetConfigurationFromConfigMap(cm)
+}
+
 func NewStartCommand() *cobra.Command {
 	log.SetLogger(zap.New(zap.JSONEncoder(func(o *zapcore.EncoderConfig) {
 		o.EncodeTime = zapcore.RFC3339TimeEncoder
@@ -46,12 +61,13 @@ func NewStartCommand() *cobra.Command {
 	}
 
 	var (
-		servingPort  uint32
-		certFile     string
-		keyFile      string
-		clientCAFile string
-		metricsSet   string
-		configFile   string
+		servingPort   uint32
+		certFile      string
+		keyFile       string
+		clientCAFile  string
+		metricsSet    string
+		configFile    string
+		sreConfigFile string
 	)
 
 	cmd.Flags().Uint32Var(&servingPort, "serving-port", 9443, "The port to serve metrics on.")
@@ -60,6 +76,7 @@ func NewStartCommand() *cobra.Command {
 	cmd.Flags().StringVar(&clientCAFile, "client-ca-file", "/etc/metrics-proxy/client-ca/ca.crt", "Path to CA certificate file for verifying client certificates (mTLS).")
 	cmd.Flags().StringVar(&metricsSet, "metrics-set", "All", "The metrics set to use for filtering (e.g. All, Telemetry, SRE).")
 	cmd.Flags().StringVar(&configFile, "config-file", "", "Path to scrape config file (required). Component discovery and endpoint resolution use file-based config and the endpoint-resolver service.")
+	cmd.Flags().StringVar(&sreConfigFile, "sre-metrics-set-config-file", "/etc/metrics-proxy/sre-metrics-config/config", "Path to the SRE metrics set configuration file.")
 
 	cmd.Run = func(cmd *cobra.Command, args []string) {
 		l.Info("Starting metrics-proxy", "version", supportedversion.String())
@@ -96,6 +113,16 @@ func NewStartCommand() *cobra.Command {
 			os.Exit(1)
 		}
 		l.Info("Config loaded", "components", configReader.GetComponentNames())
+
+		if metrics.MetricsSet(metricsSet) == metrics.MetricsSetSRE {
+			if err := loadSREMetricsSetConfiguration(sreConfigFile); err != nil {
+				if os.IsNotExist(err) {
+					l.Info("SRE metrics configuration is not mounted", "path", sreConfigFile)
+				} else {
+					l.Error(err, "Failed to load SRE metrics configuration", "path", sreConfigFile)
+				}
+			}
+		}
 
 		resolverURL := configReader.EndpointResolverURL()
 		resolverCAFile := configReader.EndpointResolverCAFile()

@@ -8,6 +8,7 @@ import (
 
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/imageprovider"
+	"github.com/openshift/hypershift/support/metrics"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -340,6 +341,34 @@ func TestApplyWatchedResourcesAnnotation(t *testing.T) {
 			g.Expect(after).To(Equal(singleVolumeTemplate.Annotations["component.hypershift.openshift.io/config-hash"]), "client and CA volumes must not hash the same Secret twice")
 		})
 	}
+}
+
+func TestApplyWatchedResourcesAnnotation_SREConfigMapChangeRollsWorkload(t *testing.T) {
+	t.Parallel()
+	g := NewGomegaWithT(t)
+
+	scheme := runtime.NewScheme()
+	g.Expect(corev1.AddToScheme(scheme)).To(Succeed())
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "clusters-test", Name: metrics.SREConfigurationConfigMapName},
+		Data:       map[string]string{metrics.SREConfigurationConfigMapKey: "{}"},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).Build()
+	cpContext := ControlPlaneContext{
+		Context: t.Context(),
+		Client:  c,
+		HCP:     &hyperv1.HostedControlPlane{ObjectMeta: metav1.ObjectMeta{Namespace: configMap.Namespace}},
+	}
+	podTemplate := &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Volumes: []corev1.Volume{cmVolume(metrics.SREConfigurationConfigMapName)}}}
+	workload := &controlPlaneWorkload[*appsv1.Deployment]{}
+
+	g.Expect(workload.applyWatchedResourcesAnnotation(cpContext, podTemplate)).To(Succeed())
+	before := podTemplate.Annotations["component.hypershift.openshift.io/config-hash"]
+	g.Expect(before).NotTo(BeEmpty())
+	configMap.Data[metrics.SREConfigurationConfigMapKey] = "kubeAPIServer: []"
+	g.Expect(c.Update(t.Context(), configMap)).To(Succeed())
+	g.Expect(workload.applyWatchedResourcesAnnotation(cpContext, podTemplate)).To(Succeed())
+	g.Expect(podTemplate.Annotations["component.hypershift.openshift.io/config-hash"]).NotTo(Equal(before))
 }
 
 func TestEnforceVolumesDefaultMode(t *testing.T) {

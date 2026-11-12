@@ -1,13 +1,20 @@
 package metricsproxy
 
 import (
-	"regexp"
+	"bytes"
+	"math"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/openshift/hypershift/support/metrics"
 
+	corev1 "k8s.io/api/core/v1"
+
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestFilter_Apply(t *testing.T) {
@@ -21,32 +28,24 @@ func TestFilter_Apply(t *testing.T) {
 		wantNames     []string
 	}{
 		{
-			name:          "When MetricsSetAll is used, it should return all metric families",
+			name:          "all metrics set passes all families through",
 			metricsSet:    metrics.MetricsSetAll,
 			componentName: "kube-apiserver",
 			families: map[string]*dto.MetricFamily{
-				"apiserver_storage_objects":           createMetricFamily("apiserver_storage_objects"),
-				"apiserver_request_total":             createMetricFamily("apiserver_request_total"),
-				"some_unrelated_metric":               createMetricFamily("some_unrelated_metric"),
-				"apiserver_current_inflight_requests": createMetricFamily("apiserver_current_inflight_requests"),
+				"apiserver_request_total": createMetricFamily("apiserver_request_total"),
+				"unrelated_metric":        createMetricFamily("unrelated_metric"),
 			},
-			wantNames: []string{
-				"apiserver_storage_objects",
-				"apiserver_request_total",
-				"some_unrelated_metric",
-				"apiserver_current_inflight_requests",
-			},
+			wantNames: []string{"apiserver_request_total", "unrelated_metric"},
 		},
 		{
-			name:          "When MetricsSetTelemetry is used with kube-apiserver, it should filter correctly",
+			name:          "telemetry keeps configured kube-apiserver families",
 			metricsSet:    metrics.MetricsSetTelemetry,
 			componentName: "kube-apiserver",
 			families: map[string]*dto.MetricFamily{
 				"apiserver_storage_objects":           createMetricFamily("apiserver_storage_objects"),
 				"apiserver_request_total":             createMetricFamily("apiserver_request_total"),
-				"apiserver_current_inflight_requests": createMetricFamily("apiserver_current_inflight_requests"),
 				"some_unrelated_metric":               createMetricFamily("some_unrelated_metric"),
-				"etcd_debugging_count":                createMetricFamily("etcd_debugging_count"),
+				"apiserver_current_inflight_requests": createMetricFamily("apiserver_current_inflight_requests"),
 			},
 			wantNames: []string{
 				"apiserver_storage_objects",
@@ -55,367 +54,264 @@ func TestFilter_Apply(t *testing.T) {
 			},
 		},
 		{
-			name:          "When MetricsSetTelemetry is used with etcd, it should filter correctly",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			componentName: "etcd",
-			families: map[string]*dto.MetricFamily{
-				"etcd_disk_wal_fsync_duration_seconds_bucket": createMetricFamily("etcd_disk_wal_fsync_duration_seconds_bucket"),
-				"etcd_mvcc_db_total_size_in_bytes":            createMetricFamily("etcd_mvcc_db_total_size_in_bytes"),
-				"etcd_server_leader_changes_seen_total":       createMetricFamily("etcd_server_leader_changes_seen_total"),
-				"etcd_some_other_metric":                      createMetricFamily("etcd_some_other_metric"),
-			},
-			wantNames: []string{
-				"etcd_disk_wal_fsync_duration_seconds_bucket",
-				"etcd_mvcc_db_total_size_in_bytes",
-				"etcd_server_leader_changes_seen_total",
-			},
-		},
-		{
-			name:          "When MetricsSetTelemetry is used with kube-controller-manager, it should filter correctly",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			componentName: "kube-controller-manager",
-			families: map[string]*dto.MetricFamily{
-				"pv_collector_total_pv_count": createMetricFamily("pv_collector_total_pv_count"),
-				"some_other_metric":           createMetricFamily("some_other_metric"),
-				"rest_client_requests_total":  createMetricFamily("rest_client_requests_total"),
-			},
-			wantNames: []string{
-				"pv_collector_total_pv_count",
-			},
-		},
-		{
-			name:          "When unknown component is provided, it should return all families",
+			name:          "unknown component passes through",
 			metricsSet:    metrics.MetricsSetTelemetry,
 			componentName: "unknown-component",
 			families: map[string]*dto.MetricFamily{
-				"metric_one":   createMetricFamily("metric_one"),
-				"metric_two":   createMetricFamily("metric_two"),
-				"metric_three": createMetricFamily("metric_three"),
+				"metric_one": createMetricFamily("metric_one"),
+				"metric_two": createMetricFamily("metric_two"),
 			},
-			wantNames: []string{
-				"metric_one",
-				"metric_two",
-				"metric_three",
-			},
-		},
-		{
-			name:          "When MetricsSetTelemetry is used with cluster-version-operator, it should filter correctly",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			componentName: "cluster-version-operator",
-			families: map[string]*dto.MetricFamily{
-				"cluster_version":                   createMetricFamily("cluster_version"),
-				"cluster_version_available_updates": createMetricFamily("cluster_version_available_updates"),
-				"cluster_operator_up":               createMetricFamily("cluster_operator_up"),
-				"some_unrelated_cvo_metric":         createMetricFamily("some_unrelated_cvo_metric"),
-			},
-			wantNames: []string{
-				"cluster_version",
-				"cluster_version_available_updates",
-				"cluster_operator_up",
-			},
+			wantNames: []string{"metric_one", "metric_two"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-
-			f := NewFilter(tt.metricsSet)
-			got := f.Apply(tt.componentName, tt.families)
-
+			got := NewFilter(tt.metricsSet).Apply(tt.componentName, tt.families)
 			if len(got) != len(tt.wantNames) {
-				t.Errorf("Apply() returned %d families, want %d", len(got), len(tt.wantNames))
+				t.Fatalf("Apply() returned %d families, want %d", len(got), len(tt.wantNames))
 			}
-
 			for _, name := range tt.wantNames {
 				if _, ok := got[name]; !ok {
-					t.Errorf("Apply() missing expected metric family: %s", name)
-				}
-			}
-
-			for name := range got {
-				found := false
-				for _, wantName := range tt.wantNames {
-					if name == wantName {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("Apply() returned unexpected metric family: %s", name)
+					t.Errorf("Apply() missing expected family %q", name)
 				}
 			}
 		})
 	}
 }
 
-func TestFilter_getOrCompile(t *testing.T) {
-	t.Parallel()
+func TestFilter_SREKnownWithoutRulesFailsClosedAndUnknownPassesThrough(t *testing.T) {
+	loadSREFilterConfig(t, "{}")
+	filter := NewFilter(metrics.MetricsSetSRE)
 
-	tests := []struct {
-		name          string
-		metricsSet    metrics.MetricsSet
-		componentName string
-		wantNil       bool
-		wantCached    bool
-	}{
-		{
-			name:          "When component has keep regex, it should cache compiled regex",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			componentName: "kube-apiserver",
-			wantNil:       false,
-			wantCached:    true,
-		},
-		{
-			name:          "When component has no keep regex, it should cache nil",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			componentName: "unknown-component",
-			wantNil:       true,
-			wantCached:    true,
-		},
-		{
-			name:          "When called twice for same component, it should return cached regex",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			componentName: "etcd",
-			wantNil:       false,
-			wantCached:    true,
-		},
+	knownFamily := createMetricFamily("etcd_server_leader_changes_seen_total")
+	if got := filter.Apply("etcd", map[string]*dto.MetricFamily{knownFamily.GetName(): knownFamily}); len(got) != 0 {
+		t.Fatalf("known component with omitted SRE rules returned %d families, want none", len(got))
+	}
+	if got, err := filter.ApplyExposition("etcd", knownFamily, []byte("etcd_server_leader_changes_seen_total 1\n")); err == nil || len(got) != 0 {
+		t.Fatalf("known component with omitted SRE rules returned %q, error %v; want fail closed", got, err)
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			f := NewFilter(tt.metricsSet)
-
-			// First call
-			got1 := f.getOrCompile(tt.componentName)
-			if (got1 == nil) != tt.wantNil {
-				t.Errorf("getOrCompile() first call returned nil=%v, want nil=%v", got1 == nil, tt.wantNil)
-			}
-
-			// Second call - should return cached value
-			got2 := f.getOrCompile(tt.componentName)
-			if got1 != got2 {
-				t.Errorf("getOrCompile() second call returned different value, cache not working")
-			}
-
-			// Verify cache contains the entry
-			f.mu.RLock()
-			cached, ok := f.cache[tt.componentName]
-			f.mu.RUnlock()
-
-			if !ok {
-				t.Errorf("getOrCompile() did not cache the result for component: %s", tt.componentName)
-			}
-
-			if cached != got1 {
-				t.Errorf("getOrCompile() cached value differs from returned value")
-			}
-		})
+	unknownFamily := createMetricFamily("custom_metric")
+	families := map[string]*dto.MetricFamily{unknownFamily.GetName(): unknownFamily}
+	if got := filter.Apply("custom-component", families); got[unknownFamily.GetName()] != unknownFamily {
+		t.Fatal("unknown component did not pass its family through")
+	}
+	input := []byte("custom_metric 42\n")
+	got, err := filter.ApplyExposition("custom-component", unknownFamily, input)
+	if err != nil || !bytes.Equal(got, input) {
+		t.Fatalf("unknown component ApplyExposition() = %q, %v; want unchanged exposition", got, err)
 	}
 }
 
-func TestFilter_getOrCompile_HandlesEmptyRegex(t *testing.T) {
-	t.Parallel()
+func TestFilter_SREOrderedKeepDropUsesSourceLabelsAndSeparators(t *testing.T) {
+	loadSREFilterConfig(t, `kubeAPIServer:
+- action: keep
+  regex: 'api;west'
+  sourceLabels: [app, region]
+- action: drop
+  regex: 'api\|west\|private'
+  separator: '|'
+  sourceLabels: [app, region, visibility]
+`)
 
-	f := NewFilter(metrics.MetricsSetTelemetry)
-
-	// Test with a component that has no keep regex
-	result := f.getOrCompile("nonexistent-component")
-
-	if result != nil {
-		t.Errorf("When regex string is empty, it should return nil, got: %v", result)
+	family := &dto.MetricFamily{
+		Name: proto.String("request_count"),
+		Type: dto.MetricType_GAUGE.Enum(),
+		Metric: []*dto.Metric{
+			gaugeMetric(1, "app", "api", "region", "west", "visibility", "public"),
+			gaugeMetric(2, "app", "api", "region", "west", "visibility", "private"),
+			gaugeMetric(3, "app", "api", "region", "east", "visibility", "public"),
+		},
 	}
 
-	// Verify it was cached as nil
-	f.mu.RLock()
-	cached, ok := f.cache["nonexistent-component"]
-	f.mu.RUnlock()
-
-	if !ok {
-		t.Error("When regex string is empty, it should cache nil result")
+	filtered, err := NewFilter(metrics.MetricsSetSRE).ApplyExposition("kube-apiserver", family, encodeMetricFamily(t, family))
+	if err != nil {
+		t.Fatalf("ApplyExposition() error: %v", err)
 	}
-
-	if cached != nil {
-		t.Errorf("When regex string is empty, cached value should be nil, got: %v", cached)
+	parsed := parseMetricFamilies(t, filtered)
+	got := parsed["request_count"]
+	if got == nil || len(got.Metric) != 1 {
+		t.Fatalf("parsed filtered family = %#v, want exactly one sample; exposition:\n%s", got, filtered)
+	}
+	labels := metricLabels(got.Metric[0])
+	if labels["region"] != "west" || labels["visibility"] != "public" || got.Metric[0].GetGauge().GetValue() != 1 {
+		t.Errorf("kept sample = labels %v, value %v; want west/public, 1", labels, got.Metric[0].GetGauge().GetValue())
 	}
 }
 
-func TestGetKeepRegexForComponent(t *testing.T) {
-	t.Parallel()
+func TestFilter_SREExplicitEmptySeparator(t *testing.T) {
+	loadSREFilterConfig(t, `kubeAPIServer:
+- action: keep
+  regex: apiwest
+  sourceLabels: [app, region]
+  separator: ''
+`)
+	family := &dto.MetricFamily{
+		Name:   proto.String("request_count"),
+		Type:   dto.MetricType_GAUGE.Enum(),
+		Metric: []*dto.Metric{gaugeMetric(1, "app", "api", "region", "west")},
+	}
+	filtered, err := NewFilter(metrics.MetricsSetSRE).ApplyExposition("kube-apiserver", family, encodeMetricFamily(t, family))
+	if err != nil || len(filtered) == 0 {
+		t.Fatalf("empty separator rule dropped matching sample: %q, %v", filtered, err)
+	}
+}
 
-	tests := []struct {
-		name          string
-		componentName string
-		metricsSet    metrics.MetricsSet
-		wantEmpty     bool
-		wantContains  string
-	}{
-		{
-			name:          "When kube-apiserver with Telemetry, it should return non-empty regex",
-			componentName: "kube-apiserver",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "apiserver_storage_objects",
-		},
-		{
-			name:          "When etcd with Telemetry, it should return non-empty regex",
-			componentName: "etcd",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "etcd_disk_wal_fsync_duration_seconds_bucket",
-		},
-		{
-			name:          "When kube-controller-manager with Telemetry, it should return non-empty regex",
-			componentName: "kube-controller-manager",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "pv_collector_total_pv_count",
-		},
-		{
-			name:          "When openshift-apiserver with Telemetry, it should return non-empty regex",
-			componentName: "openshift-apiserver",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "apiserver_storage_objects",
-		},
-		{
-			name:          "When openshift-controller-manager with Telemetry, it should return non-empty regex",
-			componentName: "openshift-controller-manager",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "openshift_build_status_phase_total",
-		},
-		{
-			name:          "When cluster-version-operator with Telemetry, it should return non-empty regex",
-			componentName: "cluster-version-operator",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "cluster_version",
-		},
-		{
-			name:          "When olm-operator with Telemetry, it should return non-empty regex",
-			componentName: "olm-operator",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "csv_succeeded",
-		},
-		{
-			name:          "When catalog-operator with Telemetry, it should return non-empty regex",
-			componentName: "catalog-operator",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "subscription_sync_total",
-		},
-		{
-			name:          "When node-tuning-operator with Telemetry, it should return non-empty regex",
-			componentName: "node-tuning-operator",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     false,
-			wantContains:  "nto_profile_calculated_total",
-		},
-		{
-			name:          "When unknown component, it should return empty string",
-			componentName: "unknown-component",
-			metricsSet:    metrics.MetricsSetTelemetry,
-			wantEmpty:     true,
-		},
-		{
-			name:          "When kube-apiserver with MetricsSetAll, it should return empty string",
-			componentName: "kube-apiserver",
-			metricsSet:    metrics.MetricsSetAll,
-			wantEmpty:     true,
-		},
+func TestFilter_ApplyExpositionHistogramBucketsAndSuffixSamples(t *testing.T) {
+	loadSREFilterConfig(t, `kubeAPIServer:
+- action: keep
+  regex: 'request_duration_seconds_(bucket|sum|count)'
+  sourceLabels: [__name__]
+- action: drop
+  regex: '0.5'
+  sourceLabels: [le]
+`)
+	family := &dto.MetricFamily{
+		Name: proto.String("request_duration_seconds"),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{{
+			Label: []*dto.LabelPair{{Name: proto.String("method"), Value: proto.String("GET")}},
+			Histogram: &dto.Histogram{
+				SampleCount: proto.Uint64(4),
+				SampleSum:   proto.Float64(1.5),
+				Bucket: []*dto.Bucket{{
+					CumulativeCount: proto.Uint64(2),
+					UpperBound:      proto.Float64(0.5),
+				}},
+			},
+		}},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+	filtered, err := NewFilter(metrics.MetricsSetSRE).ApplyExposition("kube-apiserver", family, encodeMetricFamily(t, family))
+	if err != nil {
+		t.Fatalf("ApplyExposition() error: %v", err)
+	}
+	parsed := parseMetricFamilies(t, filtered)
+	got := parsed["request_duration_seconds"]
+	if got == nil || len(got.Metric) != 1 || got.Metric[0].Histogram == nil {
+		t.Fatalf("parsed filtered histogram = %#v, want one histogram", got)
+	}
+	histogram := got.Metric[0].Histogram
+	if len(histogram.Bucket) != 1 || histogram.Bucket[0].GetUpperBound() != float64PositiveInfinity() {
+		t.Errorf("filtered histogram buckets = %#v, want only implicit +Inf bucket", histogram.Bucket)
+	}
+	if histogram.GetSampleCount() != 4 || histogram.GetSampleSum() != 1.5 {
+		t.Errorf("filtered histogram count/sum = %d/%v, want 4/1.5", histogram.GetSampleCount(), histogram.GetSampleSum())
+	}
+}
 
-			got := getKeepRegexForComponent(tt.componentName, tt.metricsSet)
+func TestFilter_ApplyExpositionSummaryQuantile(t *testing.T) {
+	loadSREFilterConfig(t, `kubeAPIServer:
+- action: keep
+  regex: '0.9'
+  sourceLabels: [quantile]
+`)
+	family := &dto.MetricFamily{
+		Name: proto.String("request_duration_seconds"),
+		Type: dto.MetricType_SUMMARY.Enum(),
+		Metric: []*dto.Metric{{
+			Summary: &dto.Summary{
+				SampleCount: proto.Uint64(5),
+				SampleSum:   proto.Float64(2.5),
+				Quantile: []*dto.Quantile{
+					{Quantile: proto.Float64(0.5), Value: proto.Float64(0.4)},
+					{Quantile: proto.Float64(0.9), Value: proto.Float64(0.8)},
+				},
+			},
+		}},
+	}
 
-			if tt.wantEmpty {
-				if got != "" {
-					t.Errorf("getKeepRegexForComponent() = %q, want empty string", got)
-				}
-			} else {
-				if got == "" {
-					t.Error("getKeepRegexForComponent() returned empty string, want non-empty")
-				}
-				if tt.wantContains != "" && !strings.Contains(got, tt.wantContains) {
-					t.Errorf("getKeepRegexForComponent() = %q, want to contain %q", got, tt.wantContains)
-				}
-			}
-		})
+	filtered, err := NewFilter(metrics.MetricsSetSRE).ApplyExposition("kube-apiserver", family, encodeMetricFamily(t, family))
+	if err != nil {
+		t.Fatalf("ApplyExposition() error: %v", err)
+	}
+	parsed := parseMetricFamilies(t, filtered)
+	got := parsed["request_duration_seconds"]
+	if got == nil || len(got.Metric) != 1 || got.Metric[0].Summary == nil {
+		t.Fatalf("parsed filtered summary = %#v, want one summary", got)
+	}
+	quantiles := got.Metric[0].Summary.Quantile
+	if len(quantiles) != 1 || quantiles[0].GetQuantile() != 0.9 || quantiles[0].GetValue() != 0.8 {
+		t.Errorf("filtered summary quantiles = %#v, want only quantile 0.9 with value 0.8", quantiles)
 	}
 }
 
 func TestFilter_Apply_ConcurrentAccess(t *testing.T) {
 	t.Parallel()
 
-	f := NewFilter(metrics.MetricsSetTelemetry)
+	filter := NewFilter(metrics.MetricsSetTelemetry)
 	families := map[string]*dto.MetricFamily{
 		"apiserver_storage_objects": createMetricFamily("apiserver_storage_objects"),
 		"apiserver_request_total":   createMetricFamily("apiserver_request_total"),
 	}
-
-	// Test concurrent access to the filter
-	done := make(chan bool)
-	for i := 0; i < 10; i++ {
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
 		go func() {
-			for j := 0; j < 100; j++ {
-				_ = f.Apply("kube-apiserver", families)
+			defer wg.Done()
+			for range 100 {
+				_ = filter.Apply("kube-apiserver", families)
 			}
-			done <- true
 		}()
 	}
-
-	for i := 0; i < 10; i++ {
-		<-done
-	}
+	wg.Wait()
 }
 
-func TestGetKeepRegexForComponent_ValidRegex(t *testing.T) {
-	t.Parallel()
-
-	components := []string{
-		"kube-apiserver",
-		"etcd",
-		"kube-controller-manager",
-		"openshift-apiserver",
-		"openshift-controller-manager",
-		"openshift-route-controller-manager",
-		"cluster-version-operator",
-		"olm-operator",
-		"catalog-operator",
-		"node-tuning-operator",
+func loadSREFilterConfig(t *testing.T, config string) {
+	t.Helper()
+	cm := &corev1.ConfigMap{Data: map[string]string{metrics.SREConfigurationConfigMapKey: config}}
+	if err := metrics.LoadSREMetricsSetConfigurationFromConfigMap(cm); err != nil {
+		t.Fatalf("load SRE metrics config: %v", err)
 	}
-
-	for _, component := range components {
-		t.Run(component, func(t *testing.T) {
-			t.Parallel()
-
-			regexStr := getKeepRegexForComponent(component, metrics.MetricsSetTelemetry)
-			if regexStr == "" {
-				t.Skip("Component has no keep regex for Telemetry set")
-			}
-
-			// Verify the regex compiles successfully
-			fullRegex := "^(" + regexStr + ")$"
-			_, err := regexp.Compile(fullRegex)
-			if err != nil {
-				t.Errorf("When regex is returned for %s, it should be valid, got error: %v", component, err)
-			}
-		})
-	}
+	t.Cleanup(func() {
+		if err := metrics.LoadSREMetricsSetConfigurationFromConfigMap(&corev1.ConfigMap{Data: map[string]string{metrics.SREConfigurationConfigMapKey: "{}"}}); err != nil {
+			t.Errorf("reset SRE metrics config: %v", err)
+		}
+	})
 }
 
-// Helper function to create a simple MetricFamily for testing
+func encodeMetricFamily(t *testing.T, family *dto.MetricFamily) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	if err := expfmt.NewEncoder(&output, expfmt.NewFormat(expfmt.TypeTextPlain)).Encode(family); err != nil {
+		t.Fatalf("encode metric family: %v", err)
+	}
+	return output.Bytes()
+}
+
+func parseMetricFamilies(t *testing.T, exposition []byte) map[string]*dto.MetricFamily {
+	t.Helper()
+	parser := expfmt.NewTextParser(model.LegacyValidation)
+	families, err := parser.TextToMetricFamilies(strings.NewReader(string(exposition)))
+	if err != nil {
+		t.Fatalf("parse exposition: %v\n%s", err, exposition)
+	}
+	return families
+}
+
+func gaugeMetric(value float64, labels ...string) *dto.Metric {
+	metric := &dto.Metric{Gauge: &dto.Gauge{Value: proto.Float64(value)}}
+	for i := 0; i < len(labels); i += 2 {
+		metric.Label = append(metric.Label, &dto.LabelPair{Name: proto.String(labels[i]), Value: proto.String(labels[i+1])})
+	}
+	return metric
+}
+
+func metricLabels(metric *dto.Metric) map[string]string {
+	labels := make(map[string]string, len(metric.Label))
+	for _, label := range metric.Label {
+		labels[label.GetName()] = label.GetValue()
+	}
+	return labels
+}
+
+func float64PositiveInfinity() float64 {
+	return math.Inf(1)
+}
+
 func createMetricFamily(name string) *dto.MetricFamily {
 	metricType := dto.MetricType_GAUGE
-	return &dto.MetricFamily{
-		Name: &name,
-		Type: &metricType,
-	}
+	return &dto.MetricFamily{Name: &name, Type: &metricType}
 }
